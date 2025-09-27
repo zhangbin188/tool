@@ -1,4 +1,4 @@
-// 需要反代的地址
+// 需要反代的地址 snippets-vless-reverse-proxy  https://github.com/neibcn/snippets-vless-reverse-proxy/blob/main/_worker.js
 const hostname = "https://snippets.neib.cn"
 
 function handleRequest(request) {
