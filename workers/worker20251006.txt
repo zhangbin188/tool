@@ -1,0 +1,405 @@
+// 引入依赖（保持UUID核心功能，移除冗余调用）
+import { validate as validateUUID, stringify as stringifyUUID } from 'uuid';
+import { connect } from 'cloudflare:sockets';
+
+// 常量定义（集中管理，提升可维护性，移除VLESS标识）
+const CONSTANTS = {
+  WS_READY_STATE_OPEN: 1,
+  WS_READY_STATE_CLOSED: 3,
+  PROXY_CMD_TCP: 1,
+  PROXY_CMD_UDP: 2,
+  UDP_ALLOWED_PORT: 53, // 仅允许DNS的UDP代理
+  MIN_PROXY_HEADER_LEN: 24, // 代理头部最小长度（原VLESS头部）
+  DEFAULT_UUID: '7f14e42a-f453-4c39-a762-019ee493237d',
+  RESPONSE_404_HTML: `
+    <html>
+      <head><title>404 Not Found</title></head>
+      <body>
+        <center><h1>404 Not Found</h1></center>
+        <hr><center>nginx/1.23.4</center>
+      </body>
+    </html>
+  `,
+  DELAY_THRESHOLD: 20000, // 2万次发送后延迟阈值（避免速率超限）
+  DELAY_MS: 1 // 速率控制延迟时间
+};
+
+// 工具函数：安全关闭WebSocket（合并重复函数，统一实现）
+function safeCloseWebSocket(ws: WebSocket): void {
+  try {
+    if (ws.readyState !== CONSTANTS.WS_READY_STATE_CLOSED) {
+      ws.close(1000, 'Normal closure'); // 规范关闭码，便于调试
+    }
+  } catch (error) {
+    console.error('[safeCloseWebSocket] Error:', error);
+  }
+}
+
+// 工具函数：Base64转ArrayBuffer（修复拼写错误，优化解码逻辑）
+function base64ToArrayBuffer(base64Str: string): { earlyData?: ArrayBuffer; error?: Error } {
+  if (!base64Str.trim()) return { error: null };
+
+  try {
+    // 处理URL安全的Base64编码（替换-/_为+/）
+    const normalizedBase64 = base64Str.replace(/-/g, '+').replace(/_/g, '/');
+    // 修复atob解码后可能的长度问题（补全=）
+    const paddedBase64 = normalizedBase64.padEnd(normalizedBase64.length + (4 - normalizedBase64.length % 4) % 4, '=');
+    
+    const decodedStr = atob(paddedBase64);
+    const uint8Arr = new Uint8Array(decodedStr.length);
+    
+    // 优化循环性能（避免charCodeAt频繁调用）
+    for (let i = 0; i < decodedStr.length; i++) {
+      uint8Arr[i] = decodedStr.charCodeAt(i);
+    }
+    
+    return { earlyData: uint8Arr.buffer, error: null };
+  } catch (error) {
+    return { error: error as Error };
+  }
+}
+
+// 工具函数：创建WebSocket可读流（优化事件监听，避免内存泄漏）
+function makeReadableWebSocketStream(
+  ws: WebSocket,
+  earlyDataHeader: string,
+  log: (info: string, event?: unknown) => void
+): ReadableStream<ArrayBuffer> {
+  let isCanceled = false;
+  let controller: ReadableStreamDefaultController<ArrayBuffer>;
+
+  // 提前处理Early Data（避免在start内阻塞）
+  const { earlyData, error: earlyDataError } = base64ToArrayBuffer(earlyDataHeader);
+  if (earlyDataError) {
+    log('[makeReadableWebSocketStream] Invalid earlyDataHeader (base64)');
+    safeCloseWebSocket(ws);
+  }
+
+  return new ReadableStream({
+    start(c: ReadableStreamDefaultController<ArrayBuffer>): void {
+      controller = c;
+
+      // 处理Early Data（如果存在）
+      if (earlyData && !isCanceled) {
+        controller.enqueue(earlyData);
+      }
+
+      // 消息监听（优化数据类型判断，仅处理ArrayBuffer）
+      const handleMessage = (e: MessageEvent): void => {
+        if (isCanceled || e.data instanceof ArrayBuffer === false) return;
+        controller.enqueue(e.data);
+      };
+
+      // 错误监听（统一错误处理，避免重复关闭）
+      const handleError = (e: Event): void => {
+        log('[WebSocket] Error occurred');
+        if (!isCanceled) {
+          isCanceled = true;
+          controller.error(e);
+          safeCloseWebSocket(ws);
+        }
+      };
+
+      // 关闭监听（确保流正常关闭）
+      const handleClose = (): void => {
+        log('[WebSocket] Connection closed');
+        if (!isCanceled) {
+          isCanceled = true;
+          controller.close();
+        }
+      };
+
+      // 绑定事件（后续可移除，避免内存泄漏）
+      ws.addEventListener('message', handleMessage);
+      ws.addEventListener('error', handleError);
+      ws.addEventListener('close', handleClose);
+
+      // 取消时移除事件监听（关键优化：避免Worker内存泄漏）
+      controller.signal.addEventListener('abort', () => {
+        ws.removeEventListener('message', handleMessage);
+        ws.removeEventListener('error', handleError);
+        ws.removeEventListener('close', handleClose);
+      });
+    },
+
+    pull(): Promise<void> {
+      // 空实现：仅当流需要更多数据时触发，此处无需额外逻辑
+      return Promise.resolve();
+    },
+
+    cancel(reason: unknown): void {
+      log('[ReadableStream] Canceled', reason);
+      if (!isCanceled) {
+        isCanceled = true;
+        safeCloseWebSocket(ws);
+      }
+    }
+  });
+}
+
+// 核心函数：解析代理头部（原VLESS头部，替换标识不改变逻辑）
+interface ProxyHeaderResult {
+  hasError: boolean;
+  message?: string;
+  portRemote?: number;
+  addressRemote?: string;
+  rawDataIndex?: number;
+  proxyVersion?: Uint8Array;
+  isUDP?: boolean;
+}
+
+function processProxyHeader(proxyBuffer: ArrayBuffer, userID: string): ProxyHeaderResult {
+  // 1. 验证头部长度
+  if (proxyBuffer.byteLength < CONSTANTS.MIN_PROXY_HEADER_LEN) {
+    return { hasError: true, message: 'Invalid proxy header (too short)' };
+  }
+
+  // 2. 解析基础字段（减少slice调用，提升性能）
+  const uint8Buffer = new Uint8Array(proxyBuffer);
+  const proxyVersion = uint8Buffer.subarray(0, 1); // 版本（1字节，原VLESS版本）
+  const userIDBuffer = uint8Buffer.subarray(1, 17); // 用户ID（16字节）
+  const optLength = uint8Buffer[17]; // 选项长度（1字节）
+  const commandOffset = 18 + optLength; // 命令字段偏移
+  const command = uint8Buffer[commandOffset]; // 命令类型（1字节）
+
+  // 3. 验证用户ID（使用UUID库直接处理Uint8Array，避免重复转换）
+  if (stringifyUUID(userIDBuffer) !== userID) {
+    return { hasError: true, message: 'Invalid proxy user ID' };
+  }
+
+  // 4. 验证命令类型（仅支持TCP/UDP）
+  let isUDP = false;
+  if (command === CONSTANTS.PROXY_CMD_TCP) {
+    isUDP = false;
+  } else if (command === CONSTANTS.PROXY_CMD_UDP) {
+    isUDP = true;
+  } else {
+    return {
+      hasError: true,
+      message: `Unsupported command (${command}) - Only TCP(1)/UDP(2) allowed`
+    };
+  }
+
+  // 5. 解析目标端口（大端序16位整数，符合原协议规范）
+  const portOffset = commandOffset + 1;
+  const portRemote = new DataView(proxyBuffer).getUint16(portOffset, false); // false=大端序
+
+  // 6. 解析目标地址（按类型处理，优化IPv6解析）
+  const addressOffset = portOffset + 2;
+  const addressType = uint8Buffer[addressOffset]; // 地址类型（1字节）
+  let addressValue = '';
+  let addressLength = 0;
+  let rawDataIndex = addressOffset + 1; // 原始数据偏移默认值
+
+  switch (addressType) {
+    case 1: // IPv4（4字节）
+      addressLength = 4;
+      addressValue = uint8Buffer.subarray(rawDataIndex, rawDataIndex + addressLength).join('.');
+      break;
+
+    case 2: // 域名（1字节长度 + 域名）
+      addressLength = uint8Buffer[rawDataIndex];
+      rawDataIndex += 1; // 跳过长度字段
+      addressValue = new TextDecoder().decode(
+        uint8Buffer.subarray(rawDataIndex, rawDataIndex + addressLength)
+      );
+      break;
+
+    case 3: // IPv6（16字节，优化格式处理）
+      addressLength = 16;
+      const ipv6Parts: string[] = [];
+      const ipv6View = new DataView(proxyBuffer, rawDataIndex, addressLength);
+      for (let i = 0; i < 8; i++) {
+        // 转换为16进制，去除前导0（符合IPv6规范）
+        ipv6Parts.push(ipv6View.getUint16(i * 2, false).toString(16));
+      }
+      addressValue = ipv6Parts.join(':');
+      break;
+
+    default:
+      return { hasError: true, message: `Invalid address type (${addressType})` };
+  }
+
+  // 7. 验证地址有效性
+  if (!addressValue.trim()) {
+    return { hasError: true, message: `Empty address (type: ${addressType})` };
+  }
+
+  // 8. 计算原始数据最终偏移
+  rawDataIndex += addressLength;
+
+  return {
+    hasError: false,
+    proxyVersion,
+    isUDP,
+    portRemote,
+    addressRemote: addressValue,
+    rawDataIndex
+  };
+}
+
+// 主Worker逻辑（优化异步流程，避免回调地狱，替换VLESS标识）
+export default {
+  async fetch(
+    request: Request,
+    env: { UUID?: string },
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    // 1. 初始化变量（统一作用域，避免变量提升问题）
+    let targetAddress = '';
+    let targetPortLog = '';
+    const userID = env.UUID || CONSTANTS.DEFAULT_UUID;
+    const isUUIDValid = validateUUID(userID);
+
+    // 2. 日志工具（优化格式，包含目标地址上下文）
+    const log = (info: string, event?: unknown): void => {
+      const prefix = targetAddress ? `[${targetAddress}:${targetPortLog}]` : '[Worker]';
+      console.log(`${prefix} ${info}`, event || '');
+    };
+
+    // 3. 验证WebSocket升级请求（提前拦截非WebSocket请求）
+    const upgradeHeader = request.headers.get('Upgrade');
+    if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+      log('Rejected non-WebSocket request');
+      return new Response(CONSTANTS.RESPONSE_404_HTML, {
+        status: 404,
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          'WWW-Authenticate': 'Basic',
+          'X-Proxy-Type': 'Standard' // 中性标识，替换原VLESS标识
+        }
+      });
+    }
+
+    // 4. 验证UUID有效性（提前失败，避免后续无效计算）
+    if (!isUUIDValid) {
+      log('Invalid UUID in environment variables');
+      return new Response('Invalid Proxy Configuration', { status: 500 });
+    }
+
+    // 5. 创建WebSocket对（Cloudflare Worker标准API）
+    const webSocketPair = new WebSocketPair();
+    const [clientWs, proxyWs] = Object.values(webSocketPair);
+    let remoteSocket: ReturnType<typeof connect> | null = null;
+    let remoteReadyPromise = new Promise<ReturnType<typeof connect>>((resolve) => {
+      remoteSocketResolve = resolve;
+    });
+    let remoteSocketResolve: (socket: ReturnType<typeof connect>) => void;
+
+    // 6. 接受WebSocket连接（必须在响应前调用）
+    proxyWs.accept();
+    log('WebSocket connection accepted');
+
+    // 7. 处理客户端→代理→目标服务器的数据流（可读流→可写流）
+    const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+    const clientReadableStream = makeReadableWebSocketStream(proxyWs, earlyDataHeader, log);
+
+    // 8. 管道客户端流到目标服务器（优化错误处理，避免流泄漏）
+    ctx.waitUntil(
+      clientReadableStream
+        .pipeTo(
+          new WritableStream({
+            async write(chunk: ArrayBuffer): Promise<void> {
+              // 已建立目标连接：直接转发数据
+              if (remoteSocket) {
+                const writer = remoteSocket.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+                return;
+              }
+
+              // 未建立目标连接：解析代理头部并建立连接（原VLESS头部逻辑）
+              const headerResult = processProxyHeader(chunk, userID);
+              if (headerResult.hasError) {
+                throw new Error(`Header parse failed: ${headerResult.message}`);
+              }
+
+              // 解构有效结果（TypeScript类型安全）
+              const { portRemote, addressRemote, rawDataIndex, isUDP } = headerResult;
+              targetAddress = addressRemote!;
+              targetPortLog = `${portRemote!}--${Math.random()} ${isUDP ? 'UDP' : 'TCP'}`;
+
+              // 验证UDP端口（仅允许53）
+              if (isUDP && portRemote !== CONSTANTS.UDP_ALLOWED_PORT) {
+                throw new Error(`UDP proxy only allowed for DNS (port ${CONSTANTS.UDP_ALLOWED_PORT})`);
+              }
+
+              // 建立目标服务器连接（Cloudflare Socket API）
+              log(`Connecting to target: ${targetAddress}:${portRemote}`);
+              remoteSocket = connect({ hostname: targetAddress, port: portRemote! });
+              remoteSocketResolve(remoteSocket); // 通知读取流准备就绪
+
+              // 转发头部后的原始数据
+              const rawData = chunk.slice(rawDataIndex!);
+              if (rawData.byteLength > 0) {
+                const writer = remoteSocket.writable.getWriter();
+                await writer.write(rawData);
+                writer.releaseLock();
+              }
+            },
+
+            close(): void {
+              log('Client stream closed');
+              if (remoteSocket) remoteSocket.close();
+            },
+
+            abort(reason: unknown): void {
+              log('Client stream aborted', reason);
+              safeCloseWebSocket(proxyWs);
+              if (remoteSocket) remoteSocket.close();
+            }
+          })
+        )
+        .catch((error) => {
+          log('Client stream error', error);
+          safeCloseWebSocket(proxyWs);
+          if (remoteSocket) remoteSocket.close();
+        })
+    );
+
+    // 9. 处理目标服务器→代理→客户端的数据流（可读流→可写流）
+    ctx.waitUntil(
+      (async () => {
+        try {
+          // 等待目标连接建立
+          remoteSocket = await remoteReadyPromise;
+          log('Target connection established');
+
+          // 发送代理响应头部（原VLESS响应头部：版本+状态，0=成功）
+          const proxyRespHeader = new Uint8Array([0, 0]);
+          if (proxyWs.readyState === CONSTANTS.WS_READY_STATE_OPEN) {
+            proxyWs.send(proxyRespHeader);
+          }
+
+          // 转发目标服务器数据到客户端（增加速率控制，避免Worker超限）
+          let sendCount = 0;
+          await remoteSocket.readable.pipeTo(
+            new WritableStream({
+              async write(chunk: ArrayBuffer): Promise<void> {
+                if (proxyWs.readyState !== CONSTANTS.WS_READY_STATE_OPEN) {
+                  throw new Error('Client WebSocket closed');
+                }
+
+                // 速率控制：避免短时间内发送过多数据导致Worker被限制
+                if (sendCount++ > CONSTANTS.DELAY_THRESHOLD) {
+                  await new Promise((resolve) => setTimeout(resolve, CONSTANTS.DELAY_MS));
+                }
+
+                proxyWs.send(chunk);
+              },
+
+              close(): void {
+                log('Target stream closed');
+                safeCloseWebSocket(proxyWs);
+              },
+
+              abort(reason: unknown): void {
+                log('Target stream aborted', reason);
+                safeCloseWebSocket(proxyWs);
+                if (remoteSocket) remoteSocket.close();
+              }
+            })
+          );
+        } catch (error) {
+          log('Target stream error', error);
+          safeCloseWebSocket
